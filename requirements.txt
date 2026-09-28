@@ -1,0 +1,24 @@
+# Pinned to the versions this suite was developed and verified against.
+
+# Async HTTP client used by VariationalClient. Talks to the local mock backend
+# by default (see mock/mock_server.py) and to any Omni-compatible base URL you
+# point it at via VR_BASE_URL.
+httpx==0.28.1
+
+# Strict request/response modelling. Decimal-safe.
+pydantic==2.11.9
+
+# Loads configuration from .env.
+python-dotenv==1.2.1
+
+# Structured, rotating logs.
+loguru==0.7.3
+
+# EIP-712 signing helper (signature_helper.py) for on-chain intent/permit
+# flows such as /api/on_chain/permit. Not needed for order placement, which
+# authenticates by session cookie.
+eth-account==0.14.0
+
+# Test runner. Async tests are driven via asyncio.run() inside sync test
+# functions, so no pytest-asyncio plugin is required.
+pytest==9.1.1

@@ -1,0 +1,43 @@
+# ---- Secrets: NEVER commit these ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cookies.txt
+session.json
+
+# ---- Reverse-engineering scratch (local only, not part of the deliverable) ----
+tools/
+.cache/
+
+# ---- Logs / runtime artifacts ----
+logs/
+*.log
+state/
+*.state.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
