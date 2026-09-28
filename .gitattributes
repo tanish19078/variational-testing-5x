@@ -1,0 +1,5 @@
+# Normalise line endings: keep LF in the repo, let Git handle the checkout.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
