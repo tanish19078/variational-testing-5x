@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Put the repo root on sys.path so tests can `import config`, `import range_bot`,
+# `import monitor`, and the `variational` / `mock` packages without an install.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
