@@ -28,6 +28,15 @@ read-only public stats feed.
 | `signature_helper.py` | EIP-712 / EIP-2612 signing primitive for on-chain flows |
 | `mock/mock_server.py` | Stdlib mock of the Omni order API, with fault injection |
 | `tests/` | pytest suite driving the full lifecycle against the mock |
+| `docs/` | write-ups — start with the frontend reverse-engineering explainer |
+
+## Docs
+
+- **[How We Read Variational Omni's Frontend](docs/frontend-api-reverse-engineering.md)**
+  — a plain-language walkthrough (with diagrams) of how the web app's network
+  requests were mapped: the two backends, the RFQ order model, the auth model,
+  the instrument naming scheme, the error vocabulary, the Cloudflare wall and
+  why we stopped there, and exactly which findings are proven vs. assumed.
 
 ## Setup
 
