@@ -10,10 +10,10 @@ want to export these, ``as_dict()`` is the seam.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any, Optional
 
 
@@ -39,8 +39,16 @@ class Metrics:
     # ---- recording ---------------------------------------------------------
 
     def record_request(self, status: Optional[int], elapsed_ms: float) -> None:
+        """Record one completed attempt.
+
+        ``status`` is None when the request never produced a response at all
+        (timeout or transport error). Those count as errors too: otherwise a
+        run where every call timed out would report "0 errors".
+        """
         self.requests += 1
-        if status is not None:
+        if status is None:
+            self.request_errors += 1
+        else:
             self.status_counts[status] += 1
             if status >= 400:
                 self.request_errors += 1
@@ -79,8 +87,11 @@ class Metrics:
         if not self._latencies_ms:
             return None
         ordered = sorted(self._latencies_ms)
-        # Nearest-rank percentile; exact enough for operational reporting.
-        idx = max(0, min(len(ordered) - 1, round(pct / 100 * len(ordered)) - 1))
+        # Nearest-rank: ceil(pct/100 * N), 1-indexed. Uses ceil rather than
+        # round() because round() is banker's rounding in Python, so an exact
+        # .5 rank (p50 of 5 samples) would round down to the wrong element.
+        rank = math.ceil(pct / 100 * len(ordered))
+        idx = max(0, min(len(ordered) - 1, rank - 1))
         return round(ordered[idx], 2)
 
     def as_dict(self) -> dict[str, Any]:

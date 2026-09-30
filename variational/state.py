@@ -19,10 +19,18 @@ import json
 import os
 import tempfile
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
 from loguru import logger
+
+
+def _money(v: Decimal | str) -> str:
+    """Exact decimal string, never scientific notation, never a float."""
+    if isinstance(v, Decimal):
+        return format(v, "f")
+    return str(v)
 
 
 class StateStore:
@@ -86,16 +94,21 @@ class StateStore:
         rfq_id: str,
         *,
         side: str,
-        limit_price: str,
-        qty: str,
+        limit_price: Decimal | str,
+        qty: Decimal | str,
         instrument: str,
     ) -> None:
-        """Note an order as live. Call this immediately after the venue acks."""
+        """Note an order as live. Call this immediately after the venue acks.
+
+        Money-like values are stringified rather than handed to json, which
+        cannot encode a Decimal and would otherwise need a float cast -- the
+        one thing this codebase never does with a price.
+        """
         self._data["orders"][rfq_id] = {
-            "side": side,
-            "limit_price": limit_price,
-            "qty": qty,
-            "instrument": instrument,
+            "side": str(side),
+            "limit_price": _money(limit_price),
+            "qty": _money(qty),
+            "instrument": str(instrument),
             "recorded_at": time.time(),
         }
         self._flush()
