@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -40,6 +41,18 @@ def _dec(key: str, default: str) -> Decimal:
     raw = os.getenv(key, default)
     try:
         return Decimal(str(raw))
+    except InvalidOperation as exc:
+        raise ValueError(f"{key} must be a decimal, got {raw!r}") from exc
+
+
+def _opt_dec(key: str) -> Optional[Decimal]:
+    """A Decimal that stays None when the variable is unset or blank, so
+    'limit not configured' is distinguishable from 'limit is zero'."""
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return Decimal(raw.strip())
     except InvalidOperation as exc:
         raise ValueError(f"{key} must be a decimal, got {raw!r}") from exc
 
@@ -77,6 +90,26 @@ class Config:
     # Monitor
     stats_url: str
 
+    # ---- optional extras -------------------------------------------------
+    # These carry defaults so existing callers keep working. Dataclass rules
+    # require defaulted fields last, which is why they live down here.
+
+    # Proactive client-side rate limit. 0 disables it.
+    rate_limit_per_s: float = 0.0
+    rate_limit_burst: int = 0
+
+    # Where the live-order journal lives (crash recovery).
+    state_file: str = "state/orders.json"
+
+    # Optional rotating log file. Empty means console only.
+    log_file: str = ""
+    log_level: str = "INFO"
+
+    # Extra risk limits. None means not enforced.
+    max_notional: Optional[Decimal] = None
+    daily_loss_limit: Optional[Decimal] = None
+    max_drawdown: Optional[Decimal] = None
+
     @property
     def instrument_id(self) -> str:
         """Canonical instrument identifier, e.g. ``P-TRUMP-USDC-3600``."""
@@ -108,4 +141,13 @@ class Config:
                 "https://omni-client-api.prod.ap-northeast-1.variational.io"
                 "/metadata/stats",
             ),
+            rate_limit_per_s=float(_dec("RATE_LIMIT_PER_S", "0")),
+            rate_limit_burst=_int("RATE_LIMIT_BURST", 0),
+            state_file=_str("STATE_FILE", "state/orders.json"),
+            log_file=_str("LOG_FILE", ""),
+            log_level=_str("LOG_LEVEL", "INFO"),
+            max_notional=_opt_dec("MAX_NOTIONAL"),
+            daily_loss_limit=_opt_dec("DAILY_LOSS_LIMIT"),
+            max_drawdown=_opt_dec("MAX_DRAWDOWN"),
         )
+
