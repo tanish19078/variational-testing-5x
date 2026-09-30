@@ -12,7 +12,11 @@ requirements.txt` is enough. Start it with:
 Supported routes:
     GET  /api/positions
     GET  /api/orders/v2?status=pending&instrument=<id>
+    GET  /api/portfolio?compute_margin=true
     POST /api/orders/new/limit    { instrument, side, order_type, limit_price, qty, ... }
+    POST /api/orders/new/market   { quote_id, side, max_slippage, is_reduce_only }
+    POST /api/quotes/indicative   { instrument, qty }  -> { quote_id, price }
+    POST /api/quotes/accept       { quote_id, side, max_slippage, is_reduce_only }
     POST /api/orders/cancel       { rfq_id }
     POST /api/orders/close_all
 
@@ -22,12 +26,17 @@ Fault injection for tests (query params on any request):
     ?__rate_limit=1      respond 429 with a Retry-After header once
 Or globally via the control endpoint:
     POST /__control  { "fail_next": 3, "status": 503 }
+
+Market simulation via the same control endpoint:
+    POST /__control  { "mark": "101.5" }   move the mark and fill crossed orders
+    POST /__control  { "balance": "5000" } set the account balance
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +54,21 @@ class _Book:
         # Fault injection counters.
         self.fail_next = 0
         self.fail_status = 500
+        # Account + quote state.
+        self.balance = Decimal("10000")
+        self.mark = Decimal("100")
+        self.quotes: dict[str, dict[str, Any]] = {}
+
+    def reset(self) -> None:
+        """Return to a clean slate (used between tests)."""
+        with self._lock:
+            self.orders.clear()
+            self.positions.clear()
+            self.quotes.clear()
+            self.fail_next = 0
+            self.fail_status = 500
+            self.balance = Decimal("10000")
+            self.mark = Decimal("100")
 
     def place(self, body: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -57,7 +81,10 @@ class _Book:
                 "limit_price": body.get("limit_price"),
                 "qty": body.get("qty"),
                 "status": "pending",
+                "is_reduce_only": bool(body.get("is_reduce_only", False)),
             }
+            if body.get("trigger_price") is not None:
+                order["trigger_price"] = body["trigger_price"]
             self.orders[rfq_id] = order
             return {"rfq_id": rfq_id, "status": "pending"}
 
@@ -76,6 +103,135 @@ class _Book:
             if instrument:
                 rows = [o for o in rows if _symbol(o.get("instrument")) == instrument]
             return list(rows)
+
+    # ---- quote flow --------------------------------------------------------
+
+    def make_quote(self, instrument: Any, qty: Any) -> dict[str, Any]:
+        """Issue an indicative quote. Two-sided: no side is chosen yet."""
+        with self._lock:
+            quote_id = str(uuid.uuid4())
+            quote = {
+                "quote_id": quote_id,
+                "instrument": instrument,
+                "qty": str(qty),
+                "price": str(self.mark),
+                "expires_at": time.time() + 10,
+            }
+            self.quotes[quote_id] = quote
+            return quote
+
+    def execute_quote(
+        self, quote_id: str, side: str, is_reduce_only: bool
+    ) -> Optional[dict[str, Any]]:
+        """Consume a quote and book the resulting fill. None if unknown/expired."""
+        with self._lock:
+            quote = self.quotes.pop(quote_id, None)
+            if quote is None:
+                return None
+            qty = Decimal(quote["qty"])
+            price = Decimal(quote["price"])
+            self._apply_fill_locked(
+                quote.get("instrument"), side, qty, price, is_reduce_only
+            )
+            return {"rfq_id": str(uuid.uuid4()), "status": "filled"}
+
+    # ---- fills / positions -------------------------------------------------
+
+    def fill_crossing_orders(self) -> list[str]:
+        """Fill any resting order the current mark has crossed.
+
+        A buy fills when mark <= its limit, a sell when mark >= its limit.
+        Returns the rfq_ids filled.
+        """
+        filled: list[str] = []
+        with self._lock:
+            for rfq_id, order in list(self.orders.items()):
+                if order["status"] != "pending" or order.get("limit_price") is None:
+                    continue
+                limit = Decimal(str(order["limit_price"]))
+                side = order.get("side")
+                crossed = (
+                    (side == "buy" and self.mark <= limit)
+                    or (side == "sell" and self.mark >= limit)
+                )
+                if not crossed:
+                    continue
+                self._apply_fill_locked(
+                    order.get("instrument"),
+                    str(side),
+                    Decimal(str(order.get("qty") or 0)),
+                    limit,
+                    bool(order.get("is_reduce_only")),
+                )
+                del self.orders[rfq_id]
+                filled.append(rfq_id)
+        return filled
+
+    def _apply_fill_locked(
+        self,
+        instrument: Any,
+        side: str,
+        qty: Decimal,
+        price: Decimal,
+        is_reduce_only: bool = False,
+    ) -> None:
+        """Update net position. Caller must hold the lock.
+
+        Positions are emitted in the live nested shape:
+        ``{"position_info": {"instrument": ..., "qty": ..., ...}}``
+        """
+        symbol = _symbol(instrument)
+        signed = qty if side == "buy" else -qty
+
+        row = None
+        for candidate in self.positions:
+            info = candidate.get("position_info", candidate)
+            if _symbol(info.get("instrument")) == symbol:
+                row = candidate
+                break
+
+        if row is None:
+            if is_reduce_only:
+                return  # nothing to reduce
+            self.positions.append(
+                {
+                    "position_info": {
+                        "instrument": instrument,
+                        "qty": str(signed),
+                        "entry_price": str(price),
+                        "mark_price": str(self.mark),
+                    }
+                }
+            )
+            return
+
+        info = row.setdefault("position_info", {})
+        current = Decimal(str(info.get("qty", "0")))
+        if is_reduce_only:
+            # Never flip through zero on a reduce-only fill.
+            if current > 0:
+                signed = max(signed, -current)
+            elif current < 0:
+                signed = min(signed, -current)
+            else:
+                return
+        new_net = current + signed
+
+        if new_net == 0:
+            self.positions.remove(row)
+            return
+
+        # Weighted average entry when adding in the same direction; keep the
+        # existing entry when reducing.
+        old_entry = Decimal(str(info.get("entry_price", price)))
+        if (current >= 0 and signed > 0) or (current <= 0 and signed < 0):
+            total = abs(current) + abs(signed)
+            info["entry_price"] = str(
+                ((old_entry * abs(current)) + (price * abs(signed))) / total
+            ) if total else str(price)
+        info["qty"] = str(new_net)
+        info["mark_price"] = str(self.mark)
+
 
 
 def _symbol(instr: Any) -> Optional[str]:
@@ -171,6 +327,12 @@ class Handler(BaseHTTPRequestHandler):
                 "result": rows,
             })
             return
+        if parsed.path == "/api/portfolio":
+            self._send(200, {
+                "balance": str(BOOK.balance),
+                "margin_computed": qs.get("compute_margin", ["false"])[0] == "true",
+            })
+            return
         self._error(404, "not found")
 
     def do_POST(self) -> None:
@@ -179,9 +341,23 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/__control":
             body = self._read_json()
-            BOOK.fail_next = int(body.get("fail_next", 0))
-            BOOK.fail_status = int(body.get("status", 500))
-            self._send(200, {"ok": True, "fail_next": BOOK.fail_next})
+            if "fail_next" in body or "status" in body:
+                BOOK.fail_next = int(body.get("fail_next", 0))
+                BOOK.fail_status = int(body.get("status", 500))
+            filled: list[str] = []
+            if "mark" in body:
+                with BOOK._lock:
+                    BOOK.mark = Decimal(str(body["mark"]))
+                filled = BOOK.fill_crossing_orders()
+            if "balance" in body:
+                with BOOK._lock:
+                    BOOK.balance = Decimal(str(body["balance"]))
+            self._send(200, {
+                "ok": True,
+                "fail_next": BOOK.fail_next,
+                "mark": str(BOOK.mark),
+                "filled": filled,
+            })
             return
 
         if self._maybe_fault(qs):
@@ -201,6 +377,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(400, "unsupported instrument")
                 return
             self._send(200, BOOK.place(body))
+            return
+
+        if parsed.path == "/api/quotes/indicative":
+            body = self._read_json()
+            for field in ("instrument", "qty"):
+                if field not in body:
+                    self._error(
+                        400,
+                        "Failed to deserialize the JSON body into the target "
+                        f"type: missing field `{field}` at line 1 column 2",
+                    )
+                    return
+            if _symbol(body.get("instrument")) is None:
+                self._error(400, "unsupported instrument")
+                return
+            self._send(200, BOOK.make_quote(body["instrument"], body["qty"]))
+            return
+
+        if parsed.path in ("/api/orders/new/market", "/api/quotes/accept"):
+            body = self._read_json()
+            for field in ("quote_id", "side"):
+                if field not in body:
+                    self._error(
+                        400,
+                        "Failed to deserialize the JSON body into the target "
+                        f"type: missing field `{field}` at line 1 column 2",
+                    )
+                    return
+            result = BOOK.execute_quote(
+                body["quote_id"],
+                str(body["side"]),
+                bool(body.get("is_reduce_only", False)),
+            )
+            if result is None:
+                self._error(400, "quote not found or expired")
+                return
+            self._send(200, result)
             return
 
         if parsed.path == "/api/orders/cancel":
@@ -226,6 +439,7 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/orders/close_all":
             with BOOK._lock:
                 BOOK.orders.clear()
+                BOOK.positions.clear()
             self._send(200, True)
             return
 

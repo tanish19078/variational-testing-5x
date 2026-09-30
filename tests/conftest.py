@@ -32,11 +32,9 @@ def mock_backend():
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    # Reset shared book state between tests.
-    BOOK.orders.clear()
-    BOOK.positions.clear()
-    BOOK.fail_next = 0
-    BOOK.fail_status = 500
+    # Reset shared book state between tests (orders, positions, quotes, mark,
+    # balance, and any latched fault injection).
+    BOOK.reset()
 
     try:
         yield f"http://127.0.0.1:{port}"
