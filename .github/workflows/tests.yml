@@ -1,0 +1,73 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is in the matrix deliberately: the rate limiter's clock bug
+        # (time.monotonic has 15.6ms resolution there) only reproduced on it.
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest -q
+        env:
+          # The suite must never depend on a real session or a real venue.
+          DRY_RUN: "true"
+          VR_BASE_URL: "http://127.0.0.1:8787"
+          VR_COOKIE: ""
+
+      - name: Check the CLI is importable and self-describing
+        run: python -m cli --help
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail if a credential was committed
+        run: |
+          set -e
+          # A real session cookie, a Cloudflare clearance token, or a bare JWT
+          # must never reach the repository. .env is gitignored; this catches
+          # the case where something slipped into tracked source instead.
+          #
+          # Test fixtures that must be credential-shaped (to prove the log
+          # scrubber catches them) carry an explicit `allowlist-secret` marker
+          # on the same line. The scan stays strict everywhere else rather than
+          # excluding tests/ wholesale, which would blind it to a real paste.
+          hits=$(git grep -nE 'vr-token=ey|cf_clearance=[A-Za-z0-9_.-]{20,}' \
+                   -- . ':!.github/*' \
+                 | grep -v 'allowlist-secret' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::a session credential appears in tracked files"
+            exit 1
+          fi
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked and must not be"
+            exit 1
+          fi
+          echo "no credentials found in tracked files"

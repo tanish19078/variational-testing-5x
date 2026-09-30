@@ -213,9 +213,12 @@ def test_state_creates_parent_directory(tmp_path):
 
 
 def test_scrub_removes_cookies_and_jwts():
+    # These values are synthetic but must be credential-shaped for the test to
+    # mean anything. allowlist-secret
     dirty = (
-        "cookie: vr-token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij; "
-        "cf_clearance=SOMEOPAQUEVALUE; other=keepme"
+        "cookie: vr-token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij; "  # allowlist-secret
+        "cf_clearance=SOMEOPAQUEVALUE_padded_to_look_real_0123456789; "  # allowlist-secret
+        "other=keepme"
     )
     clean = scrub(dirty)
     assert "eyJhbGciOiJIUzI1NiJ9" not in clean
