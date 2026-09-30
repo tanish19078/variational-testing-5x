@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from decimal import Decimal
 from types import TracebackType
 from typing import Any, Optional
@@ -32,16 +33,24 @@ from .errors import (
     VariationalTimeoutError,
 )
 from .models import (
+    AcceptQuoteRequest,
+    IndicativeQuoteRequest,
     Instrument,
     LimitOrderRequest,
+    MarketOrderRequest,
     OpenOrder,
     OrderAck,
     OrderType,
+    Portfolio,
     Position,
+    Quote,
     Side,
+    TriggerOrderRequest,
     parse_open_orders,
     parse_positions,
 )
+from .metrics import Metrics
+from .ratelimit import TokenBucket
 
 # Status codes worth retrying with backoff.
 _RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -50,9 +59,24 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 class VariationalClient:
     """Async API client. Use as an async context manager."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        metrics: Optional[Metrics] = None,
+        rate_limiter: Optional[TokenBucket] = None,
+    ) -> None:
         self._cfg = config
         self._client: Optional[httpx.AsyncClient] = None
+        self.metrics = metrics if metrics is not None else Metrics()
+        if rate_limiter is not None:
+            self._limiter = rate_limiter
+        else:
+            self._limiter = TokenBucket(
+                config.rate_limit_per_s,
+                config.rate_limit_burst or None,
+            )
+
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -109,20 +133,36 @@ class VariationalClient:
         attempt = 0
         while True:
             attempt += 1
+            # Proactive rate limiting: stay under our own budget rather than
+            # discovering the venue's the hard way (429).
+            await self._limiter.acquire()
+            started = time.perf_counter()
             try:
                 resp = await self._client.request(
                     method, path, params=params, json=json
                 )
             except httpx.TimeoutException as e:
+                self.metrics.record_request(
+                    None, (time.perf_counter() - started) * 1000
+                )
                 if attempt <= self._cfg.max_retries:
+                    self.metrics.record_retry()
                     await self._sleep_backoff(attempt)
                     continue
                 raise VariationalTimeoutError(f"timeout after {attempt} attempts") from e
             except httpx.HTTPError as e:
+                self.metrics.record_request(
+                    None, (time.perf_counter() - started) * 1000
+                )
                 if attempt <= self._cfg.max_retries:
+                    self.metrics.record_retry()
                     await self._sleep_backoff(attempt)
                     continue
                 raise VariationalNetworkError(str(e)) from e
+
+            self.metrics.record_request(
+                resp.status_code, (time.perf_counter() - started) * 1000
+            )
 
             if resp.status_code < 400:
                 if not resp.content:
@@ -138,6 +178,7 @@ class VariationalClient:
             )
             if should_retry:
                 retry_after = self._parse_retry_after(resp)
+                self.metrics.record_retry()
                 logger.warning(
                     "HTTP {} on {} {} (attempt {}/{}), retrying",
                     resp.status_code, method, path, attempt, self._cfg.max_retries,
@@ -250,6 +291,7 @@ class VariationalClient:
 
         data = await self._request("POST", "/api/orders/new/limit", json=payload)
         ack = OrderAck.model_validate(data)
+        self.metrics.record_order_placed()
         logger.info("Placed {} {} @ {} -> rfq_id={}", side.value, qty, limit_price, ack.rfq_id)
         return ack
 
@@ -260,6 +302,7 @@ class VariationalClient:
             return True
 
         await self._request("POST", "/api/orders/cancel", json={"rfq_id": rfq_id})
+        self.metrics.record_order_cancelled()
         logger.info("Cancelled rfq_id={}", rfq_id)
         return True
 
@@ -274,3 +317,163 @@ class VariationalClient:
             except VariationalAPIError as e:
                 logger.warning("cancel_all: failed to cancel {}: {}", o.rfq_id, e)
         return n
+
+    async def close_all(self) -> bool:
+        """POST /api/orders/close_all - flatten everything. Honours DRY_RUN."""
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] would POST /api/orders/close_all")
+            return True
+        await self._request("POST", "/api/orders/close_all")
+        logger.info("close_all sent")
+        return True
+
+    # ---- account -----------------------------------------------------------
+
+    async def get_portfolio(self) -> Portfolio:
+        """GET /api/portfolio?compute_margin=true - balance and margin."""
+        data = await self._request(
+            "GET", "/api/portfolio", params={"compute_margin": "true"}
+        )
+        if not isinstance(data, dict):
+            return Portfolio()
+        return Portfolio.model_validate(data)
+
+    async def get_balance(self) -> Optional[Decimal]:
+        """Convenience wrapper returning just the account balance."""
+        return (await self.get_portfolio()).balance
+
+    # ---- quote-based execution ---------------------------------------------
+
+    async def request_indicative_quote(
+        self, qty: Decimal, instrument: Optional[Instrument] = None
+    ) -> Quote:
+        """POST /api/quotes/indicative - ask what price you would get.
+
+        Note there is no ``side`` here: the quote is two-sided and you pick the
+        direction when executing against the returned ``quote_id``.
+        """
+        req = IndicativeQuoteRequest(
+            instrument=instrument or self._instrument(), qty=qty
+        )
+        data = await self._request(
+            "POST", "/api/quotes/indicative", json=req.to_payload()
+        )
+        quote = Quote.model_validate(data)
+        logger.info("indicative quote {} -> price={}", quote.quote_id, quote.price)
+        return quote
+
+    async def place_market_order(
+        self,
+        quote_id: str,
+        side: Side,
+        *,
+        max_slippage: Optional[Decimal] = None,
+        is_reduce_only: bool = False,
+    ) -> OrderAck:
+        """POST /api/orders/new/market - execute against an indicative quote.
+
+        Unlike a normal exchange this takes no instrument or qty: both are fixed
+        by the quote you are accepting. Honours DRY_RUN.
+        """
+        req = MarketOrderRequest(
+            quote_id=quote_id,
+            side=side,
+            max_slippage=max_slippage if max_slippage is not None else self._cfg.max_slippage,
+            is_reduce_only=is_reduce_only,
+        )
+        payload = req.to_payload()
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] would POST /api/orders/new/market {}", payload)
+            return OrderAck(rfq_id="dry-run-000000000000", status="dry_run")
+
+        data = await self._request("POST", "/api/orders/new/market", json=payload)
+        ack = OrderAck.model_validate(data)
+        self.metrics.record_order_placed()
+        logger.info("Market {} on quote {} -> rfq_id={}", side.value, quote_id, ack.rfq_id)
+        return ack
+
+    async def accept_quote(
+        self,
+        quote_id: str,
+        side: Side,
+        *,
+        max_slippage: Optional[Decimal] = None,
+        is_reduce_only: bool = False,
+    ) -> OrderAck:
+        """POST /api/quotes/accept - payload-identical to the market endpoint.
+
+        Used by the live reference client to *close* a position (side flipped,
+        ``is_reduce_only=True``). Honours DRY_RUN.
+        """
+        req = AcceptQuoteRequest(
+            quote_id=quote_id,
+            side=side,
+            max_slippage=max_slippage if max_slippage is not None else self._cfg.max_slippage,
+            is_reduce_only=is_reduce_only,
+        )
+        payload = req.to_payload()
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] would POST /api/quotes/accept {}", payload)
+            return OrderAck(rfq_id="dry-run-000000000000", status="dry_run")
+
+        data = await self._request("POST", "/api/quotes/accept", json=payload)
+        ack = OrderAck.model_validate(data)
+        self.metrics.record_order_placed()
+        logger.info("Accepted quote {} {} -> rfq_id={}", quote_id, side.value, ack.rfq_id)
+        return ack
+
+    async def market_enter(
+        self, side: Side, qty: Decimal, *, is_reduce_only: bool = False
+    ) -> OrderAck:
+        """The full two-step taker flow: get a quote, then execute it.
+
+        This is the shape the live reference implementation uses, wrapped into
+        one call so strategies do not have to remember the ordering.
+        """
+        quote = await self.request_indicative_quote(qty)
+        return await self.place_market_order(
+            quote.quote_id, side, is_reduce_only=is_reduce_only
+        )
+
+    # ---- conditional orders ------------------------------------------------
+
+    async def place_trigger_order(
+        self,
+        side: Side,
+        order_type: OrderType,
+        trigger_price: Decimal,
+        qty: Decimal,
+        *,
+        limit_price: Optional[Decimal] = None,
+        is_reduce_only: bool = True,
+    ) -> OrderAck:
+        """Place a stop_limit / take_profit / stop_loss order.
+
+        Field names here are inferred from the frontend bundle rather than
+        confirmed live - see docs/ for the proven-vs-assumed scorecard.
+        """
+        if order_type == OrderType.LIMIT:
+            raise ValueError("use place_limit_order for plain limit orders")
+        req = TriggerOrderRequest(
+            instrument=self._instrument(),
+            side=side,
+            order_type=order_type,
+            trigger_price=trigger_price,
+            qty=qty,
+            limit_price=limit_price,
+            is_reduce_only=is_reduce_only,
+        )
+        payload = req.to_payload()
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] would POST /api/orders/new/limit {}", payload)
+            return OrderAck(rfq_id="dry-run-000000000000", status="dry_run")
+
+        data = await self._request("POST", "/api/orders/new/limit", json=payload)
+        ack = OrderAck.model_validate(data)
+        self.metrics.record_order_placed()
+        logger.info(
+            "Placed {} {} trigger={} -> rfq_id={}",
+            order_type.value, side.value, trigger_price, ack.rfq_id,
+        )
+        return ack
+
