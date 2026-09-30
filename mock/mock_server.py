@@ -365,7 +365,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/orders/new/limit":
             body = self._read_json()
-            for field in ("instrument", "side", "order_type", "limit_price"):
+            for field in ("instrument", "side", "order_type"):
                 if field not in body:
                     self._error(
                         400,
@@ -373,6 +373,15 @@ class Handler(BaseHTTPRequestHandler):
                         f"type: missing field `{field}` at line 1 column 2",
                     )
                     return
+            # A plain limit order needs a price; a conditional order is armed
+            # by trigger_price and may execute at market once triggered.
+            if body.get("limit_price") is None and body.get("trigger_price") is None:
+                self._error(
+                    400,
+                    "Failed to deserialize the JSON body into the target "
+                    "type: missing field `limit_price` at line 1 column 2",
+                )
+                return
             if _symbol(body.get("instrument")) is None:
                 self._error(400, "unsupported instrument")
                 return
