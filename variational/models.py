@@ -22,7 +22,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 
 class Side(str, Enum):
@@ -112,7 +112,17 @@ class OpenOrder(BaseModel):
 
 
 class Position(BaseModel):
-    """An open position as returned by /api/positions."""
+    """An open position as returned by /api/positions.
+
+    The live endpoint wraps each row in a ``position_info`` object::
+
+        [{"position_info": {"instrument": {...}, "qty": "0.01", ...}, ...}]
+
+    so the validator below unwraps it, while still accepting a flat row (which
+    is what some other responses and our own fixtures use). Without this, every
+    position silently parsed as qty=0 - the position cap and reduce-only logic
+    would have been reading zeros against the real venue.
+    """
 
     model_config = ConfigDict(extra="allow")
 
@@ -122,12 +132,153 @@ class Position(BaseModel):
     entry_price: Optional[Decimal] = None
     mark_price: Optional[Decimal] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_position_info(cls, data: Any) -> Any:
+        """Flatten {position_info: {...}} into the top level, outer keys winning
+        only where the inner object does not define them."""
+        if not isinstance(data, dict):
+            return data
+        inner = data.get("position_info")
+        if not isinstance(inner, dict):
+            return data
+        merged = {k: v for k, v in data.items() if k != "position_info"}
+        merged.update(inner)
+        return merged
+
     @property
     def signed_qty(self) -> Decimal:
-        """Position size signed by side (sell -> negative)."""
+        """Position size, signed so that shorts are negative.
+
+        Two shapes exist in the wild: an explicit ``side`` alongside an absolute
+        qty, or a already-signed ``qty`` with no side. Handle both - taking
+        abs() unconditionally would turn every short into a long.
+        """
+        if self.side is None:
+            return self.qty
         if self.side == Side.SELL:
             return -abs(self.qty)
         return abs(self.qty)
+
+
+class QuoteExecutionRequest(BaseModel):
+    """Body for POST /api/orders/new/market AND POST /api/quotes/accept.
+
+    Both endpoints take the *same* shape, and neither takes an instrument or a
+    qty: you first ask for an indicative quote, then execute against its
+    ``quote_id``. That is the part of Omni's model most likely to surprise you
+    coming from a normal exchange.
+
+    Note the field is ``max_slippage`` here, not ``slippage_limit`` as on the
+    limit-order endpoint. Confirmed against a client that runs live.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quote_id: str
+    side: Side
+    max_slippage: Optional[Decimal] = None
+    is_reduce_only: bool = False
+
+    @field_serializer("max_slippage", when_used="json")
+    def _dec_to_str(self, v: Optional[Decimal]) -> Optional[str]:
+        return None if v is None else format(v, "f")
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+# The market-order and quote-accept endpoints are payload-identical, so these
+# names are aliases that document intent at the call site.
+MarketOrderRequest = QuoteExecutionRequest
+AcceptQuoteRequest = QuoteExecutionRequest
+
+
+class TriggerOrderRequest(BaseModel):
+    """Body for a conditional order: stop_limit, take_profit, or stop_loss.
+
+    ``trigger_price`` is the level that arms the order; ``limit_price`` is where
+    it then rests (omitted for a pure stop_loss/take_profit, which execute at
+    market once triggered).
+
+    NOTE: the ``trigger_price`` field name is inferred from the frontend bundle
+    rather than confirmed by a live round-trip - see docs/ for the
+    proven-vs-assumed scorecard.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instrument: Instrument
+    side: Side
+    order_type: OrderType
+    trigger_price: Decimal
+    qty: Decimal
+    limit_price: Optional[Decimal] = None
+    slippage_limit: Optional[Decimal] = None
+    is_reduce_only: bool = True  # conditional orders are usually exits
+    use_mark_price: bool = True  # trigger against mark by default
+
+    @field_serializer(
+        "trigger_price", "limit_price", "qty", "slippage_limit", when_used="json"
+    )
+    def _dec_to_str(self, v: Optional[Decimal]) -> Optional[str]:
+        return None if v is None else format(v, "f")
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class IndicativeQuoteRequest(BaseModel):
+    """Body for POST /api/quotes/indicative - 'what price would I get?'.
+
+    Deliberately has **no** ``side``: the quote comes back two-sided and you
+    choose the direction when you execute against the ``quote_id``. Confirmed
+    against a client that runs live.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instrument: Instrument
+    qty: Decimal
+
+    @field_serializer("qty", when_used="json")
+    def _dec_to_str(self, v: Decimal) -> str:
+        return format(v, "f")
+
+    def to_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="json", exclude_none=True)
+
+
+class Portfolio(BaseModel):
+    """Response from GET /api/portfolio?compute_margin=true."""
+
+    model_config = ConfigDict(extra="allow")
+
+    balance: Optional[Decimal] = None
+
+
+class Quote(BaseModel):
+    """An indicative quote returned by the venue."""
+
+    model_config = ConfigDict(extra="allow")
+
+    quote_id: str
+    price: Optional[Decimal] = None
+    qty: Optional[Decimal] = None
+    side: Optional[Side] = None
+    expires_at: Optional[float] = None
+
+
+class Fill(BaseModel):
+    """An execution report. Shape is inferred; extra fields are preserved."""
+
+    model_config = ConfigDict(extra="allow")
+
+    rfq_id: Optional[str] = None
+    side: Optional[Side] = None
+    qty: Decimal = Decimal(0)
+    price: Optional[Decimal] = None
+    instrument: Optional[Instrument] = None
 
 
 def parse_open_orders(payload: Any) -> list[OpenOrder]:
