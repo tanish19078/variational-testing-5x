@@ -13,6 +13,7 @@ hooks into the client call sites and consults ``can_open`` before entering.
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Optional
 
 from loguru import logger
 
@@ -29,11 +30,32 @@ class RiskEngine:
         self,
         max_position_size: Decimal,
         kill_switch_threshold: int = 3,
+        *,
+        max_notional: Optional[Decimal] = None,
+        daily_loss_limit: Optional[Decimal] = None,
+        max_drawdown: Optional[Decimal] = None,
     ) -> None:
         self._max_position = abs(Decimal(max_position_size))
         self._threshold = int(kill_switch_threshold)
         self._consecutive_failures = 0
         self._tripped = False
+
+        # Optional limits. None means "not enforced", so a caller that only
+        # cares about position size keeps the original behaviour.
+        self._max_notional = (
+            None if max_notional is None else abs(Decimal(max_notional))
+        )
+        self._daily_loss_limit = (
+            None if daily_loss_limit is None else abs(Decimal(daily_loss_limit))
+        )
+        self._max_drawdown = (
+            None if max_drawdown is None else abs(Decimal(max_drawdown))
+        )
+
+        # PnL tracking for the loss/drawdown limits.
+        self._realized = Decimal(0)
+        self._peak_equity = Decimal(0)
+
 
     # ---- state ------------------------------------------------------------
 
@@ -81,6 +103,47 @@ class RiskEngine:
         self._consecutive_failures = 0
         logger.info("risk: engine reset")
 
+    # ---- pnl / drawdown accounting ----------------------------------------
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        return self._realized
+
+    @property
+    def drawdown(self) -> Decimal:
+        """How far below the session's peak equity we currently sit (>= 0)."""
+        return max(Decimal(0), self._peak_equity - self._realized)
+
+    def record_pnl(self, delta: Decimal) -> None:
+        """Book a realized PnL change, then enforce loss and drawdown limits.
+
+        Trips the kill switch if either limit is breached, because both mean
+        "stop trading now" rather than "retry".
+        """
+        self._realized += Decimal(delta)
+        if self._realized > self._peak_equity:
+            self._peak_equity = self._realized
+
+        if (
+            self._daily_loss_limit is not None
+            and self._realized <= -self._daily_loss_limit
+            and not self._tripped
+        ):
+            self.trip(
+                f"daily loss limit: realized {self._realized} "
+                f"<= -{self._daily_loss_limit}"
+            )
+            return
+
+        if (
+            self._max_drawdown is not None
+            and self.drawdown >= self._max_drawdown
+            and not self._tripped
+        ):
+            self.trip(
+                f"max drawdown: {self.drawdown} >= {self._max_drawdown}"
+            )
+
     # ---- gates ------------------------------------------------------------
 
     def ensure_live(self) -> None:
@@ -88,8 +151,17 @@ class RiskEngine:
         if self._tripped:
             raise KillSwitchError("trading halted by kill switch")
 
-    def can_open(self, current_net_qty: Decimal, add_qty: Decimal) -> bool:
-        """Whether adding ``add_qty`` keeps abs(net position) within the cap."""
+    def can_open(
+        self,
+        current_net_qty: Decimal,
+        add_qty: Decimal,
+        price: Optional[Decimal] = None,
+    ) -> bool:
+        """Whether adding ``add_qty`` stays within every configured cap.
+
+        ``price`` is only needed for the notional check; without it that check
+        is skipped rather than guessed at.
+        """
         if self._tripped:
             return False
         projected = abs(Decimal(current_net_qty) + Decimal(add_qty))
@@ -99,13 +171,26 @@ class RiskEngine:
                 projected, self._max_position,
             )
             return False
+        if self._max_notional is not None and price is not None:
+            notional = projected * abs(Decimal(price))
+            if notional > self._max_notional:
+                logger.warning(
+                    "risk: blocked - projected notional {} exceeds cap {}",
+                    notional, self._max_notional,
+                )
+                return False
         return True
 
-    def check_open(self, current_net_qty: Decimal, add_qty: Decimal) -> None:
+    def check_open(
+        self,
+        current_net_qty: Decimal,
+        add_qty: Decimal,
+        price: Optional[Decimal] = None,
+    ) -> None:
         """Raising variant of :meth:`can_open`."""
         self.ensure_live()
-        if not self.can_open(current_net_qty, add_qty):
+        if not self.can_open(current_net_qty, add_qty, price):
             raise VariationalError(
-                f"position cap: |{current_net_qty} + {add_qty}| "
-                f"> {self._max_position}"
+                f"risk gate rejected {current_net_qty} + {add_qty} "
+                f"(cap {self._max_position}, notional cap {self._max_notional})"
             )
