@@ -192,9 +192,17 @@ class RangeTradingBot:
             return result
 
 
-async def main() -> None:
-    cfg = Config.from_env()
-    risk = RiskEngine(cfg.max_position_size, cfg.kill_switch_threshold)
+async def main(cfg: Optional[Config] = None) -> None:
+    """Run the bot. Accepts a Config so the CLI can pass overrides through;
+    falls back to the environment when invoked directly."""
+    cfg = cfg or Config.from_env()
+    risk = RiskEngine(
+        cfg.max_position_size,
+        cfg.kill_switch_threshold,
+        max_notional=cfg.max_notional,
+        daily_loss_limit=cfg.daily_loss_limit,
+        max_drawdown=cfg.max_drawdown,
+    )
 
     async with VariationalClient(cfg) as client:
         bot = RangeTradingBot(cfg, client, risk)
