@@ -466,7 +466,13 @@ Keeping this honest, because a doc that overclaims is worse than no doc:
 | `/api/*` sits behind Cloudflare and blocks plain httpx | ✅ **Proven** — 403 |
 | Orders authenticate by cookie, not per-order signature | ✅ Strong — from captures + bundle |
 | Order returns `rfq_id`, cancel consumes it | ✅ Strong — captures + bundle + SDK |
+| Positions arrive nested under `position_info` | ✅ **Corroborated** — §13, a client that runs live |
+| Market orders are quote-based (`quote_id`, not instrument+qty) | ✅ **Corroborated** — §13 |
+| Quote endpoints spell it `max_slippage`, limit uses `slippage_limit` | ✅ **Corroborated** — §13 |
+| `GET /api/portfolio?compute_margin=true` returns balance | ✅ **Corroborated** — §13 |
+| `/api/quotes/accept` is payload-identical to `/orders/new/market` | ✅ **Corroborated** — §13 |
 | The four `order_type` values | 🟡 **From the bundle**, not probed live |
+| `trigger_price` is the field name for conditional orders | 🟡 **Inferred from the bundle**, not probed |
 | `is_auto_resize` / `use_mark_price` semantics | 🟡 **Inferred from names**, not probed |
 | Our client works against the *real* venue | ❌ **Not established.** It works against a faithful mock. |
 
@@ -474,7 +480,160 @@ That last row is the important one. This repo proves the *logic* is correct. It
 does not prove Variational's production server will accept it — and it honestly
 can't, until they publish an API.
 
+"Corroborated" is a weaker claim than "proven by our own probe." It means an
+independent client that *has* been run against the live venue sends that exact
+shape. That is strong evidence, but it is still someone else's evidence.
+
 ---
+
+## 13. Corroboration from a client that actually runs live
+
+Partway through, we found [`whalesslayer/ak47_var_market_maker`](https://github.com/whalesslayer/ak47_var_market_maker)
+— a market maker for the same venue. It is cruder than this repo overall
+(synchronous, floats for money, no tests, no risk engine, bare `except
+Exception`). But it has one thing we don't: **it has been run against the real
+Omni backend.** Its payload shapes are therefore not inferences. They are
+observations.
+
+We inspected it read-only and copied nothing — no code, and deliberately no
+credentials. (Their `config/config.py` ships with `VAR_ADDRESS = ''` and
+`VAR_COOKIE = ''`, so there was nothing to leak even by accident. We checked.)
+
+It exposed **four genuine bugs** in our client that our own tests could never
+have caught, because our mock agreed with our misunderstanding:
+
+```mermaid
+flowchart TD
+    A["Our mock was built<br/>from our reading of<br/>the frontend bundle"] --> B["Our tests asserted<br/>against that mock"]
+    B --> C["Tests passed"]
+    C --> D{"Does that prove<br/>the wire format<br/>is right?"}
+    D -->|"No"| E["Mock and client shared<br/>the same wrong belief.<br/>A closed loop."]
+    E --> F["External live-tested client<br/>breaks the loop"]
+    F --> G["4 real bugs found"]
+```
+
+### Bug 1 — positions were silently parsing as zero
+
+The live endpoint nests each row:
+
+```json
+[{ "position_info": { "instrument": {...}, "qty": "0.01", "entry_price": "1.94" } }]
+```
+
+We read `qty` and `instrument` from the **top level**. Pydantic, with
+`extra="allow"`, happily accepted the row, put `position_info` in the extras,
+and left `qty` at its default of `0`.
+
+Nothing raised. Nothing logged. Every position read as flat. Which means:
+
+- the position cap in `RiskEngine.can_open` was comparing against zero,
+- the reduce-only logic thought there was nothing to reduce,
+- and the bot would have cheerfully doubled a position it believed was empty.
+
+The fix is a `model_validator(mode="before")` that flattens the wrapper while
+still accepting a flat row:
+
+```python
+@model_validator(mode="before")
+@classmethod
+def _unwrap_position_info(cls, data: Any) -> Any:
+    inner = data.get("position_info")
+    if not isinstance(inner, dict):
+        return data
+    merged = {k: v for k, v in data.items() if k != "position_info"}
+    merged.update(inner)
+    return merged
+```
+
+### Bug 2 — every short would have flipped to a long
+
+`signed_qty` took `abs()` and then applied the sign from `side`:
+
+```python
+# before
+return -abs(self.qty) if self.side == Side.SELL else abs(self.qty)
+```
+
+But the live shape can carry an **already-signed** `qty` with **no `side`
+field at all**. With `side is None`, the old code fell through to
+`abs(self.qty)` — turning `-2` into `+2`. A short position would have been
+read as a long one of the same size, which is the worst possible direction for
+that error to go.
+
+```python
+# after
+if self.side is None:
+    return self.qty          # already signed; abs() would flip shorts
+```
+
+### Bug 3 — market orders aren't what we thought at all
+
+We had modelled a market order as `{instrument, side, qty, slippage_limit}`,
+by analogy with the limit endpoint. That is wrong in every field.
+
+Market execution on Omni is a **two-step quote flow**:
+
+```mermaid
+sequenceDiagram
+    participant B as Bot
+    participant V as Venue
+    B->>V: POST /api/quotes/indicative<br/>instrument + qty (NO side)
+    V-->>B: quote_id + price
+    Note over B: The quote is TWO-SIDED.<br/>You pick direction at execution.
+    B->>V: POST /api/orders/new/market<br/>quote_id + side + max_slippage
+    V-->>B: rfq_id
+```
+
+Three distinct surprises in there:
+
+1. The market body takes **no instrument and no qty** — both are fixed by the
+   quote you are accepting.
+2. The indicative request takes **no `side`** — the quote comes back two-sided.
+3. The slippage field is **`max_slippage`**, not `slippage_limit` as on the
+   limit endpoint. The same concept is spelled two different ways on two
+   endpoints of the same API.
+
+And `/api/quotes/accept` turns out to be **payload-identical** to
+`/api/orders/new/market`, which is why `MarketOrderRequest` and
+`AcceptQuoteRequest` are aliases of one `QuoteExecutionRequest` model rather
+than two near-duplicate classes.
+
+### Bug 4 — an endpoint we never knew existed
+
+`GET /api/portfolio?compute_margin=true` returns the account balance. We had
+no balance call at all.
+
+### What changed in the mock as a result
+
+Fixing the client is only half of it. The mock had to start lying *less*:
+
+- positions are now emitted **nested under `position_info`**, so the parser fix
+  is genuinely exercised rather than asserted against a fixture shaped to agree
+  with it;
+- it serves the quote flow, `/api/portfolio`, and quote-based market orders;
+- `POST /__control {"mark": "..."}` moves the mark and fills any resting order
+  the move crossed, with weighted-average entry on adds and no
+  flip-through-zero on reduce-only fills.
+
+That last one means position accounting is now testable without a live venue.
+
+### The lesson worth keeping
+
+**A mock you wrote from your own assumptions cannot falsify those assumptions.**
+Our 35 tests were all passing while the position parser was returning zeros.
+The tests weren't bad; they were circular. Breaking that loop needed evidence
+from outside the repo.
+
+### What we deliberately did *not* take
+
+Their `requirements.txt` is one line: `cloudscraper==1.2.71`. That is a
+Cloudflare bypass, and it works. We left it out — see §10. The architectural
+consequence is that this repo runs its full automation against a local mock
+plus a live read-only monitor, and that limitation is stated in the scorecard
+above rather than hidden.
+
+---
+
 
 ## Appendix A — Endpoint catalogue
 
@@ -482,16 +641,21 @@ Everything we mapped. ✅ = implemented in this repo, 📋 = documented only.
 
 | Method | Path | Purpose | |
 |---|---|---|---|
-| GET | `/api/positions` | open positions | ✅ |
+| GET | `/api/positions` | open positions (nested `position_info`) | ✅ |
 | GET | `/api/orders/v2?status=pending&instrument=…` | resting orders (paginated) | ✅ |
+| GET | `/api/portfolio?compute_margin=true` | account balance + margin | ✅ |
 | POST | `/api/orders/new/limit` | place a limit order → `rfq_id` | ✅ |
 | POST | `/api/orders/cancel` | cancel by `rfq_id` | ✅ |
-| POST | `/api/orders/close_all` | flatten everything | ✅ (mock) |
-| POST | `/api/orders/new/market` | market order | 📋 |
-| POST | `/api/quotes/indicative` | ask for a price | 📋 |
-| POST | `/api/quotes/accept` | take that price | 📋 |
+| POST | `/api/orders/close_all` | flatten everything | ✅ |
+| POST | `/api/quotes/indicative` | `{instrument, qty}` → `quote_id` + price | ✅ |
+| POST | `/api/orders/new/market` | `{quote_id, side, max_slippage, is_reduce_only}` | ✅ |
+| POST | `/api/quotes/accept` | identical body; used to close | ✅ |
 | POST | `/api/on_chain/permit` | EIP-2612 deposit permit | 📋 (`signature_helper.py`) |
 | GET | `…/metadata/stats` | **public** market data | ✅ |
+
+Conditional orders (`stop_limit`, `take_profit`, `stop_loss`) go to
+`/api/orders/new/limit` with a `trigger_price`. The endpoint is confirmed; the
+field name is still an inference from the bundle.
 
 ---
 
@@ -502,10 +666,23 @@ Everything we mapped. ✅ = implemented in this repo, 📋 = documented only.
 python monitor.py --all
 python monitor.py --watch
 
-# Run the full stack locally
-python -m mock.mock_server     # terminal 1
-python range_bot.py            # terminal 2
+# Everything through one entry point. DRY_RUN is the default;
+# --live is the only way off it.
+python -m cli mock                 # terminal 1
+python -m cli status               # terminal 2
+python -m cli quote --qty 1
+python -m cli place --side buy --price 1.90 --qty 1       # dry run
+python -m cli --live place --side buy --price 1.90 --qty 1
+
+# Watch a resting order fill when the mark crosses it
+curl -X POST http://127.0.0.1:8787/__control \
+     -H 'content-type: application/json' -d '{"mark":"1.85"}'
+python -m cli status
+
+# Run the bot
+python -m cli run
 
 # Prove the logic
-pytest                         # 35 tests
+pytest                             # 85 tests
 ```
+
