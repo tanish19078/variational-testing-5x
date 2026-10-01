@@ -96,10 +96,12 @@ if __name__ == "__main__":
     demo_owner = Account.from_key(demo_key).address
     typed = build_permit_typed_data(
         token_name="USD Coin",
-        verifying_contract="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        # Canonical USDC contract on Ethereum mainnet and the burn-ish 0x..01
+        # spender: public infrastructure and a placeholder, not personal keys.
+        verifying_contract="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # allowlist-address
         chain_id=1,
         owner=demo_owner,
-        spender="0x0000000000000000000000000000000000000001",
+        spender="0x0000000000000000000000000000000000000001",  # allowlist-address
         value=1_000_000,
         nonce=0,
         deadline=4_102_444_800,

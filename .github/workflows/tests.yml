@@ -70,4 +70,19 @@ jobs:
             echo "::error::.env is tracked and must not be"
             exit 1
           fi
+
+          # A wallet address is not secret the way a token is -- it is public
+          # on-chain by design -- but committing a personal one permanently
+          # links this repo's owner to their trading activity. Any 40-hex
+          # address must therefore be a deliberate choice: either an obvious
+          # placeholder, or annotated `allowlist-address` with a reason.
+          addrs=$(git grep -nE '0x[a-fA-F0-9]{40}' -- . ':!.github/*' \
+                  | grep -v 'allowlist-address' \
+                  | grep -vE '0x(0{40}|1{40}|DEADBEEF[0-9A-Fa-f]{32})' || true)
+          if [ -n "$addrs" ]; then
+            echo "$addrs"
+            echo "::error::un-annotated wallet address in tracked files"
+            exit 1
+          fi
+
           echo "no credentials found in tracked files"

@@ -227,9 +227,13 @@ def test_scrub_removes_cookies_and_jwts():
 
 
 def test_scrub_masks_wallet_addresses():
-    clean = scrub("wallet 0x7B2368315ABe4E907c289e43691E9C61a474E5eD traded")
-    assert "0x7B2368315ABe4E907c289e43691E9C61a474E5eD" not in clean
-    assert "0x7B23" in clean and "E5eD" in clean
+    # A deliberately fake address. Never use a real one here: a test fixture is
+    # committed forever, and an address in a public repo permanently links that
+    # repo's owner to their on-chain activity.
+    fake = "0xDEADBEEF00000000000000000000000000C0FFEE"
+    clean = scrub(f"wallet {fake} traded")
+    assert fake not in clean
+    assert "0xDEAD" in clean and "FFEE" in clean
 
 
 def test_scrub_leaves_ordinary_text_alone():
